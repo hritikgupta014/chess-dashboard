@@ -1,21 +1,18 @@
-import streamlit as st
-import requests
-import json
-import re
-import os
-import time
-from datetime import datetime, timezone
-from collections import defaultdict, Counter
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-load_dotenv()
+# ── KEYS — local .env OR Streamlit Cloud secrets ─────────────────────────────
+def _get_key(name):
+    try:
+        return st.secrets[name]
+    except:
+        return os.getenv(name, "")
 
-# ── KEYS — loaded from .env file ─────────────────────────────────────────────
-# Create a file called .env in your chess-dashboard folder with:
-#   GROQ_API_KEY=your_key_here
-#   LICHESS_TOKEN=your_token_here
-_GROQ_KEY    = os.getenv("GROQ_API_KEY", "")
-_LICHESS_TOKEN = os.getenv("LICHESS_TOKEN", "")
+_GROQ_KEY      = _get_key("GROQ_API_KEY")
+_LICHESS_TOKEN = _get_key("LICHESS_TOKEN")
 
 st.set_page_config(
     page_title="♟ hritikgupta — Chess Dashboard",
