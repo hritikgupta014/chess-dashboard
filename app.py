@@ -4,7 +4,7 @@ import json
 import re
 import os
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict
 
 try:
@@ -23,6 +23,12 @@ GROQ_KEY     = _get("GROQ_API_KEY")
 NEWS_KEY     = _get("NEWS_API_KEY")   # optional — free at newsapi.org
 USERNAME     = "hritikgupta"
 LI_HEADERS   = {"User-Agent": "ChessDashboard/1.0 hritikgupta"}
+
+# ── IST TIMEZONE ─────────────────────────────────────────────────────────────
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def to_ist(dt_utc):
+    return dt_utc.astimezone(IST)
 
 st.set_page_config(
     page_title="♟ hritikgupta · Chess Dashboard",
@@ -95,6 +101,23 @@ div[data-testid="stTabContent"]{padding:0 !important;}
 .game-rating{font-family:'Playfair Display',serif;font-size:1.1rem;font-weight:700;color:#c9a84c;text-align:right;}
 .game-link{display:inline-block;font-family:'JetBrains Mono',monospace;font-size:9px;color:#0a0a0a;background:#c9a84c;padding:2px 8px;text-decoration:none;margin-top:2px;}
 .title-badge{font-family:'JetBrains Mono',monospace;font-size:9px;background:#c9a84c;color:#0a0a0a;padding:1px 5px;font-weight:600;margin-left:.3rem;}
+
+/* Today game cards */
+.today-card{background:#0d0d0d;border:1px solid #1a1a1a;padding:.8rem 1rem;margin-bottom:.4rem;display:flex;align-items:center;gap:1rem;}
+.today-card.win{border-left:3px solid #4a8c3f;}
+.today-card.loss{border-left:3px solid #8c3f3f;}
+.today-card.draw{border-left:3px solid #555;}
+.today-result{font-family:'JetBrains Mono',monospace;font-size:10px;font-weight:600;padding:2px 8px;flex-shrink:0;letter-spacing:.1em;}
+.today-result.win{background:#4a8c3f;color:#fff;}
+.today-result.loss{background:#8c3f3f;color:#fff;}
+.today-result.draw{background:#555;color:#fff;}
+.today-time{font-family:'JetBrains Mono',monospace;font-size:9px;color:#444;min-width:64px;}
+
+/* Puzzle themes */
+.puzzle-theme{display:block;background:#0d0d0d;border:1px solid #1a1a1a;padding:.7rem .9rem;text-decoration:none;transition:border-color .2s;}
+.puzzle-theme:hover{border-color:#c9a84c;}
+.puzzle-theme-name{font-family:'Inter',sans-serif;font-size:12px;font-weight:500;color:#e8e4dc;}
+.puzzle-theme-desc{font-family:'Inter',sans-serif;font-size:10px;color:#555;margin-top:.15rem;}
 
 /* Opening rows */
 .opening-row{display:flex;align-items:center;gap:.6rem;padding:.5rem 0;border-bottom:1px solid #141414;}
@@ -174,6 +197,39 @@ def load_supabase():
         st.error(f"Supabase error: {e}")
     return None
 
+@st.cache_data(ttl=120, show_spinner=False)
+def fetch_today_games():
+    """Fetch ALL games played today (IST day boundary) live from Lichess."""
+    now_ist  = datetime.now(IST)
+    midnight = now_ist.replace(hour=0, minute=0, second=0, microsecond=0)
+    since_ms = int(midnight.timestamp() * 1000)
+    hdrs = {**LI_HEADERS, "Accept": "application/x-ndjson"}
+    games = []
+    try:
+        with requests.get(
+            f"https://lichess.org/api/games/user/{USERNAME}",
+            params={"since": since_ms, "opening": "true",
+                    "moves": "false", "clocks": "false", "evals": "false"},
+            headers=hdrs, stream=True, timeout=30
+        ) as r:
+            if r.status_code == 200:
+                for line in r.iter_lines():
+                    if line:
+                        try: games.append(json.loads(line))
+                        except: pass
+    except: pass
+    games.sort(key=lambda g: g.get("createdAt", 0))
+    return games
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_daily_puzzle():
+    try:
+        r = requests.get("https://lichess.org/api/puzzle/daily",
+                         headers=LI_HEADERS, timeout=8)
+        if r.status_code == 200: return r.json()
+    except: pass
+    return None
+
 @st.cache_data(ttl=600, show_spinner=False)
 def fetch_news(api_key, query="chess tournament 2025", count=9):
     if not api_key: return []
@@ -196,6 +252,38 @@ def fetch_tournaments():
             return r.json().get("active",[]) + r.json().get("upcoming",[])
     except: pass
     return []
+
+# ── TODAY HELPERS ────────────────────────────────────────────────────────────
+def parse_my_game(g):
+    """Extract my side / result / opponent / rating change from a raw game."""
+    uname   = USERNAME.lower()
+    players = g.get("players",{})
+    white   = players.get("white",{}); black = players.get("black",{})
+    wu = (white.get("user",{}).get("name") or white.get("user",{}).get("id","")).lower()
+    if wu == uname: my_side, my_data, opp_data = "white", white, black
+    else:           my_side, my_data, opp_data = "black", black, white
+    winner = g.get("winner"); status = g.get("status","")
+    if   winner == my_side:                                result = "win"
+    elif winner is None or status in ("draw","stalemate"): result = "draw"
+    else:                                                  result = "loss"
+    opp_user = opp_data.get("user",{})
+    clock    = g.get("clock",{})
+    tc = f"{clock.get('initial',0)//60}+{clock.get('increment',0)}" if clock else g.get("speed","")
+    return {
+        "id":         g.get("id",""),
+        "side":       my_side,
+        "result":     result,
+        "status":     status,
+        "perf":       g.get("perf",""),
+        "tc":         tc,
+        "opening":    g.get("opening",{}).get("name","Unknown"),
+        "opp_name":   opp_user.get("name") or opp_user.get("id","?"),
+        "opp_title":  opp_user.get("title",""),
+        "opp_rating": opp_data.get("rating","?"),
+        "my_rating":  my_data.get("rating","?"),
+        "diff":       my_data.get("ratingDiff", 0),
+        "time_ist":   datetime.fromtimestamp(g.get("createdAt",0)/1000, tz=IST).strftime("%I:%M %p"),
+    }
 
 # ── GROQ ─────────────────────────────────────────────────────────────────────
 def call_groq(prompt, api_key, max_tokens=2000):
@@ -263,16 +351,17 @@ with st.sidebar:
     if news_key: st.session_state["news_key"] = news_key
 
     st.markdown("---")
-    st.markdown("""<p>Data auto-refreshes every 2 hrs via GitHub Actions → Supabase.</p>""",
+    st.markdown("""<p>Data auto-refreshes every 2 hrs via GitHub Actions → Supabase.
+    Today tab fetches live from Lichess.</p>""",
                 unsafe_allow_html=True)
     st.markdown("---")
     if st.button("⟳  Reload data"):
         st.cache_data.clear()
-        for k in ["ai_report","study_plan","phase_report","ai_news"]:
+        for k in ["ai_report","study_plan","phase_report","ai_news","today_ai"]:
             if k in st.session_state: del st.session_state[k]
         st.rerun()
     st.markdown("---")
-    st.markdown("<div style='font-size:10px;color:#1f1f1f;font-family:JetBrains Mono,monospace;line-height:1.8'>DATA: LICHESS + SUPABASE<br>AI: GROQ LLAMA 70B<br>NEWS: NEWSAPI FREE<br>REFRESH: 2HRS AUTO</div>",
+    st.markdown("<div style='font-size:10px;color:#1f1f1f;font-family:JetBrains Mono,monospace;line-height:1.8'>DATA: LICHESS + SUPABASE<br>AI: GROQ LLAMA 70B<br>NEWS: NEWSAPI FREE<br>REFRESH: 2HRS AUTO<br>TIMEZONE: IST</div>",
                 unsafe_allow_html=True)
 
 # ── LOAD ──────────────────────────────────────────────────────────────────────
@@ -293,8 +382,17 @@ if not db_data:
 
 profile  = db_data.get("profile", {})
 stats    = db_data.get("stats", {})
-updated  = db_data.get("updated_at","")[:16].replace("T"," ")
 perfs    = profile.get("perfs",{}) if profile else {}
+
+# Updated timestamp → IST
+updated_raw = db_data.get("updated_at","")
+try:
+    updated_dt = datetime.fromisoformat(updated_raw)
+    if updated_dt.tzinfo is None:
+        updated_dt = updated_dt.replace(tzinfo=timezone.utc)
+    updated = to_ist(updated_dt).strftime("%d %b %I:%M %p")
+except:
+    updated = updated_raw[:16].replace("T"," ")
 
 # ── MASTHEAD ──────────────────────────────────────────────────────────────────
 blitz_r  = perfs.get("blitz",{}).get("rating","—")
@@ -303,13 +401,13 @@ bullet_r = perfs.get("bullet",{}).get("rating","—")
 title_b  = profile.get("title","") if profile else ""
 title_h  = f"<span style='font-family:JetBrains Mono;font-size:.9rem;color:#c9a84c'>{title_b} </span>" if title_b else ""
 created  = profile.get("createdAt",0)
-since    = datetime.fromtimestamp(created/1000,tz=timezone.utc).strftime("%b %Y") if created else "—"
+since    = to_ist(datetime.fromtimestamp(created/1000,tz=timezone.utc)).strftime("%b %Y") if created else "—"
 total_lc = profile.get("count",{}).get("all", stats.get("total",0))
 
 st.markdown(f"""<div class="masthead">
     <div class="masthead-eyebrow">Lichess · Chess Intelligence Dashboard</div>
     <div class="masthead-title">{title_h}<span>hritik</span>gupta</div>
-    <div class="masthead-meta">Since {since} &nbsp;·&nbsp; {total_lc:,} lifetime games &nbsp;·&nbsp; Blitz {blitz_r} &nbsp;·&nbsp; Rapid {rapid_r} &nbsp;·&nbsp; Bullet {bullet_r} &nbsp;·&nbsp; Updated {updated} UTC</div>
+    <div class="masthead-meta">Since {since} &nbsp;·&nbsp; {total_lc:,} lifetime games &nbsp;·&nbsp; Blitz {blitz_r} &nbsp;·&nbsp; Rapid {rapid_r} &nbsp;·&nbsp; Bullet {bullet_r} &nbsp;·&nbsp; Updated {updated} IST</div>
 </div>""", unsafe_allow_html=True)
 
 # ── STAT STRIP ────────────────────────────────────────────────────────────────
@@ -328,7 +426,7 @@ st.markdown(f"""<div class="stat-strip">
 </div>""", unsafe_allow_html=True)
 
 # ── TABS ──────────────────────────────────────────────────────────────────────
-tabs = st.tabs(["📊 My Stats", "♟ Game Analysis", "🧠 AI Coach", "📰 News", "🏆 Tournaments"])
+tabs = st.tabs(["📊 My Stats", "🌅 Today", "🧩 Puzzles", "♟ Game Analysis", "🧠 AI Coach", "📰 News", "🏆 Tournaments"])
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # TAB 1 — MY STATS
@@ -422,10 +520,10 @@ with tabs[0]:
     weekday = stats.get("weekday",{})
     if hourly or weekday:
         st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
-        st.markdown('<div class="section-head"><div class="section-title">When You Play Best</div><div class="section-pill">Hour · Day</div></div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-head"><div class="section-title">When You Play Best</div><div class="section-pill">Hour · Day · IST</div></div>', unsafe_allow_html=True)
         col1,col2 = st.columns(2)
         with col1:
-            st.markdown('<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#555;text-transform:uppercase;letter-spacing:.12em;margin-bottom:.6rem">By hour (UTC)</div>', unsafe_allow_html=True)
+            st.markdown('<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#555;text-transform:uppercase;letter-spacing:.12em;margin-bottom:.6rem">By hour (IST)</div>', unsafe_allow_html=True)
             html=""
             for h in range(24):
                 d=hourly.get(str(h),{"w":0,"g":0})
@@ -440,7 +538,7 @@ with tabs[0]:
                 </div>"""
             st.markdown(html, unsafe_allow_html=True)
         with col2:
-            st.markdown('<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#555;text-transform:uppercase;letter-spacing:.12em;margin-bottom:.6rem">By day of week</div>', unsafe_allow_html=True)
+            st.markdown('<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#555;text-transform:uppercase;letter-spacing:.12em;margin-bottom:.6rem">By day of week (IST)</div>', unsafe_allow_html=True)
             html=""
             for day in ["Mon","Tue","Wed","Thu","Fri","Sat","Sun"]:
                 d=weekday.get(day,{"w":0,"g":0})
@@ -563,9 +661,233 @@ with tabs[0]:
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 2 — GAME ANALYSIS
+# TAB 2 — TODAY (all of today's games, IST, live fetch)
 # ═══════════════════════════════════════════════════════════════════════════════
 with tabs[1]:
+    today_str = datetime.now(IST).strftime("%A, %d %B %Y")
+    st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
+    st.markdown(f'<div class="section-head"><div class="section-title">Today\'s Games</div><div class="section-pill">{today_str} · Live · IST</div></div>', unsafe_allow_html=True)
+
+    with st.spinner("Fetching today's games from Lichess..."):
+        raw_today = fetch_today_games()
+
+    if not raw_today:
+        st.markdown("""<div class="no-data">No games played today yet.<br>
+            <span style="color:#c9a84c">Rest day — or time to fix that? ♟</span></div>""", unsafe_allow_html=True)
+    else:
+        today = [parse_my_game(g) for g in raw_today]
+
+        # ── Today summary strip ──
+        tw = sum(1 for g in today if g["result"]=="win")
+        td = sum(1 for g in today if g["result"]=="draw")
+        tl = sum(1 for g in today if g["result"]=="loss")
+        net = sum(g["diff"] for g in today if isinstance(g["diff"], int))
+        opp_ratings = [g["opp_rating"] for g in today if isinstance(g["opp_rating"], int)]
+        avg_opp = round(sum(opp_ratings)/len(opp_ratings)) if opp_ratings else "—"
+        twr = round(tw/len(today)*100,1)
+        net_c = "#4a8c3f" if net>0 else "#8c3f3f" if net<0 else "#555"
+        net_s = f"+{net}" if net>0 else str(net)
+
+        st.markdown(f"""<div class="stat-strip" style="border:1px solid #1a1a1a;margin-bottom:1.2rem">
+            <div class="stat-cell"><div class="stat-val">{len(today)}</div><div class="stat-lbl">Games</div></div>
+            <div class="stat-cell"><div class="stat-val" style="color:#4a8c3f">{tw}W</div><div class="stat-lbl">{td}D · {tl}L</div></div>
+            <div class="stat-cell"><div class="stat-val">{twr}%</div><div class="stat-lbl">Win rate</div></div>
+            <div class="stat-cell"><div class="stat-val" style="color:{net_c}">{net_s}</div><div class="stat-lbl">Net rating</div></div>
+            <div class="stat-cell"><div class="stat-val">{avg_opp}</div><div class="stat-lbl">Avg opponent</div></div>
+        </div>""", unsafe_allow_html=True)
+
+        # ── Per-format net rating ──
+        fmt_net = defaultdict(int); fmt_cnt = defaultdict(int)
+        for g in today:
+            if isinstance(g["diff"], int):
+                fmt_net[g["perf"]] += g["diff"]
+            fmt_cnt[g["perf"]] += 1
+        if fmt_net:
+            chips = ""
+            for pf, n in sorted(fmt_net.items(), key=lambda x:-fmt_cnt[x[0]]):
+                c = "#4a8c3f" if n>0 else "#8c3f3f" if n<0 else "#555"
+                s = f"+{n}" if n>0 else str(n)
+                chips += f"""<span style="font-family:'JetBrains Mono',monospace;font-size:10px;background:#111;border:1px solid #1f1f1f;padding:4px 10px;margin-right:.5rem">
+                    <span style="color:#a09a8e">{pf.upper()}</span> <span style="color:{c}">{s}</span> <span style="color:#333">({fmt_cnt[pf]}g)</span></span>"""
+            st.markdown(f'<div style="margin-bottom:1.2rem">{chips}</div>', unsafe_allow_html=True)
+
+        # ── Game list (newest first) ──
+        for g in reversed(today):
+            res = g["result"]
+            res_lbl = {"win":"WIN","draw":"DRAW","loss":"LOSS"}[res]
+            piece = "♔" if g["side"]=="white" else "♚"
+            tb = f'<span class="title-badge">{g["opp_title"]}</span>' if g["opp_title"] else ""
+            d = g["diff"]
+            dc = "#4a8c3f" if isinstance(d,int) and d>0 else "#8c3f3f" if isinstance(d,int) and d<0 else "#555"
+            ds = (f"+{d}" if d>0 else str(d)) if isinstance(d,int) else "—"
+            st.markdown(f"""<div class="today-card {res}">
+                <div class="today-time">{g['time_ist']}</div>
+                <div class="today-result {res}">{res_lbl}</div>
+                <div style="flex:1">
+                    <div class="game-opp">{piece} vs {g['opp_name']}{tb} <span style="color:#555;font-size:11px">({g['opp_rating']})</span></div>
+                    <div class="game-meta">{g['perf']} {g['tc']} · {g['opening'][:44]} · {g['status']}</div>
+                </div>
+                <div style="text-align:right;flex-shrink:0">
+                    <div style="font-family:'Playfair Display',serif;font-size:1.1rem;font-weight:700;color:{dc}">{ds}</div>
+                    <a class="game-link" href="https://lichess.org/{g['id']}" target="_blank">Analyse ↗</a>
+                </div>
+            </div>""", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        # ── AI session analysis ──
+        st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
+        st.markdown('<div class="section-head"><div class="section-title">AI Session Analysis</div><div class="section-pill">Groq · Today only</div></div>', unsafe_allow_html=True)
+        groq_key = st.session_state.get("groq_key","")
+        if not groq_key:
+            st.markdown('<div class="no-data">Add your Groq API key in the sidebar to enable AI session analysis</div>', unsafe_allow_html=True)
+        else:
+            if st.button("✦  Analyse today's session", key="gen_today"):
+                with st.spinner("Coach is reviewing today's games..."):
+                    lines = []
+                    for i, g in enumerate(today, 1):
+                        d = g["diff"] if isinstance(g["diff"], int) else 0
+                        lines.append(f"{i}. [{g['time_ist']}] {g['perf']} {g['tc']} as {g['side']}: "
+                                     f"{g['result'].upper()} vs {g['opp_name']} ({g['opp_rating']}) — "
+                                     f"{g['opening']} — ended by {g['status']} — rating {d:+d}")
+                    seq = "".join(g["result"][0] for g in today)
+                    today_prompt = f"""Today's chess session for {USERNAME} ({today_str}, all times IST).
+Career context: Blitz {blitz_r}, Rapid {rapid_r}, Bullet {bullet_r}.
+
+SESSION: {len(today)} games — {tw}W {td}D {tl}L ({twr}%) — net rating {net_s} — avg opponent {avg_opp}
+Result sequence (chronological): {seq}
+
+GAMES (chronological):
+{chr(10).join(lines)}
+
+Write a session review with these sections (use ** for headers):
+**Session Verdict** — one-paragraph honest overall assessment with the numbers.
+**What Went Right** — specific games/openings/patterns that worked, cite game numbers.
+**What Went Wrong** — losses and patterns, cite game numbers. Check the result sequence for tilt (losses clustering at the end after wins/losses early) and comment on session discipline: should the player have stopped earlier?
+**Opening Notes** — which openings appeared today and how they scored.
+**Tomorrow's Focus** — 2-3 concrete things to do differently in the next session."""
+                    st.session_state["today_ai"] = call_groq(today_prompt, groq_key, max_tokens=1500)
+            if "today_ai" in st.session_state:
+                render_ai(st.session_state["today_ai"], f"♟ Session Review · {today_str}")
+        st.markdown('</div>', unsafe_allow_html=True)
+
+    if not raw_today:
+        st.markdown('</div>', unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 3 — PUZZLES
+# ═══════════════════════════════════════════════════════════════════════════════
+with tabs[2]:
+    # ── Daily puzzle ──
+    st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
+    st.markdown('<div class="section-head"><div class="section-title">Daily Puzzle</div><div class="section-pill">Lichess · Interactive</div></div>', unsafe_allow_html=True)
+
+    dp = fetch_daily_puzzle()
+    if dp:
+        pz = dp.get("puzzle",{})
+        p_rating = pz.get("rating","?")
+        p_plays  = pz.get("plays",0)
+        p_themes = ", ".join(pz.get("themes",[])[:5])
+        st.markdown(f"""<div style="display:flex;gap:1.5rem;margin-bottom:.8rem;font-family:'JetBrains Mono',monospace;font-size:10px;color:#555">
+            <span>RATING <span style="color:#c9a84c">{p_rating}</span></span>
+            <span>SOLVED <span style="color:#c9a84c">{p_plays:,}×</span></span>
+            <span>THEMES <span style="color:#a09a8e">{p_themes}</span></span>
+        </div>""", unsafe_allow_html=True)
+
+    # Interactive daily puzzle embed — solvable right in the dashboard
+    st.markdown("""<iframe src="https://lichess.org/training/frame?theme=brown&bg=dark"
+        width="100%" height="446" frameborder="0"
+        style="border:1px solid #1a1a1a;max-width:600px;display:block;"></iframe>""",
+        unsafe_allow_html=True)
+    st.markdown("""<div style="margin-top:.6rem">
+        <a href="https://lichess.org/training/daily" target="_blank" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:#c9a84c;text-decoration:none">Open daily puzzle full-screen ↗</a>
+    </div>""", unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Themed practice ──
+    st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
+    st.markdown('<div class="section-head"><div class="section-title">Themed Practice</div><div class="section-pill">Train by weakness</div></div>', unsafe_allow_html=True)
+
+    theme_groups = {
+        "Tactics": [
+            ("fork","Fork","Attack two pieces at once"),
+            ("pin","Pin","Piece can't move without loss"),
+            ("skewer","Skewer","Reverse pin — big piece first"),
+            ("discoveredAttack","Discovered Attack","Move one, attack with another"),
+            ("doubleCheck","Double Check","Two checks at once"),
+            ("sacrifice","Sacrifice","Give material for advantage"),
+            ("deflection","Deflection","Lure defender away"),
+            ("hangingPiece","Hanging Piece","Spot the free material"),
+            ("trappedPiece","Trapped Piece","Win the stuck piece"),
+        ],
+        "Attack & Mate": [
+            ("mateIn2","Mate in 2","Forced mate — 2 moves"),
+            ("mateIn3","Mate in 3","Forced mate — 3 moves"),
+            ("backRankMate","Back Rank Mate","Classic back rank patterns"),
+            ("kingsideAttack","Kingside Attack","Attack the castled king"),
+            ("exposedKing","Exposed King","Punish the open king"),
+            ("attraction","Attraction","Drag the king out"),
+        ],
+        "Endgames": [
+            ("endgame","All Endgames","Mixed endgame practice"),
+            ("pawnEndgame","Pawn Endgames","King + pawn technique"),
+            ("rookEndgame","Rook Endgames","Most common in practice"),
+            ("queenEndgame","Queen Endgames","Precision required"),
+            ("bishopEndgame","Bishop Endgames","Good vs bad bishop"),
+            ("knightEndgame","Knight Endgames","Knight technique"),
+            ("zugzwang","Zugzwang","Any move loses"),
+        ],
+        "Skills": [
+            ("opening","Opening Traps","Early-game tactics"),
+            ("middlegame","Middlegame","Core fighting positions"),
+            ("quietMove","Quiet Moves","Hardest to spot"),
+            ("defensiveMove","Defence","Save lost positions"),
+            ("crushing","Crushing","Find the knockout"),
+            ("advantage","Convert Advantage","Winning technique"),
+        ],
+    }
+    for group, themes in theme_groups.items():
+        st.markdown(f'<div style="font-family:JetBrains Mono,monospace;font-size:9px;color:#555;text-transform:uppercase;letter-spacing:.15em;margin:1rem 0 .5rem">{group}</div>', unsafe_allow_html=True)
+        html = '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:.4rem">'
+        for slug, name, desc in themes:
+            html += f"""<a class="puzzle-theme" href="https://lichess.org/training/{slug}" target="_blank">
+                <div class="puzzle-theme-name">{name}</div>
+                <div class="puzzle-theme-desc">{desc}</div>
+            </a>"""
+        html += '</div>'
+        st.markdown(html, unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── AI-recommended themes ──
+    st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
+    st.markdown('<div class="section-head"><div class="section-title">What Should I Train?</div><div class="section-pill">AI · Based on your data</div></div>', unsafe_allow_html=True)
+    groq_key = st.session_state.get("groq_key","")
+    if not groq_key:
+        st.markdown('<div class="no-data">Add your Groq API key in the sidebar for personalised puzzle recommendations</div>', unsafe_allow_html=True)
+    else:
+        if st.button("✦  Recommend puzzle themes for me", key="gen_puzzle_rec"):
+            with st.spinner("Matching puzzle themes to your weaknesses..."):
+                wr_w = stats.get("wr_w",[]); wr_b = stats.get("wr_b",[])
+                terminations = stats.get("terminations",{})
+                tilt = sum(1 for s in stats.get("session_data",[]) if len(s)>=6 and s[:3].count("w")>=2 and s[-3:].count("l")>=2)
+                rec_prompt = f"""Chess player {USERNAME}: Blitz {blitz_r}, Rapid {rapid_r}, {stats.get('total',0):,} career games.
+Worst openings as White: {', '.join(f"{r[0]} ({r[1]}%)" for r in (wr_w or [])[-4:])}
+Worst openings as Black: {', '.join(f"{r[0]} ({r[1]}%)" for r in (wr_b or [])[-4:])}
+How games end: {dict(list(terminations.items())[:8])}
+Tilt sessions: {tilt}
+Puzzle rating: {perfs.get('puzzle',{}).get('rating','unknown')}
+
+Lichess puzzle themes available: fork, pin, skewer, discoveredAttack, doubleCheck, sacrifice, deflection, hangingPiece, trappedPiece, mateIn2, mateIn3, backRankMate, kingsideAttack, exposedKing, attraction, endgame, pawnEndgame, rookEndgame, queenEndgame, bishopEndgame, knightEndgame, zugzwang, opening, middlegame, quietMove, defensiveMove, crushing, advantage.
+
+Recommend exactly 5 puzzle themes for this player. For each (use ** for the theme name as header): why this theme based on their specific data, and how many puzzles per day. Order by priority."""
+                st.session_state["puzzle_rec"] = call_groq(rec_prompt, groq_key, max_tokens=1200)
+        if "puzzle_rec" in st.session_state:
+            render_ai(st.session_state["puzzle_rec"], "♟ Personalised Training Plan · Groq")
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 4 — GAME ANALYSIS
+# ═══════════════════════════════════════════════════════════════════════════════
+with tabs[3]:
     st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
     st.markdown('<div class="section-head"><div class="section-title">Analyse a Game</div><div class="section-pill">Lichess Engine</div></div>', unsafe_allow_html=True)
 
@@ -641,9 +963,9 @@ with tabs[1]:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 3 — AI COACH
+# TAB 5 — AI COACH
 # ═══════════════════════════════════════════════════════════════════════════════
-with tabs[2]:
+with tabs[4]:
     groq_key = st.session_state.get("groq_key","")
 
     if not groq_key:
@@ -769,9 +1091,9 @@ Write ONLY a 7-day study plan. **Monday** through **Sunday**. Each day: one spec
         st.markdown('</div>', unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 4 — NEWS
+# TAB 6 — NEWS
 # ═══════════════════════════════════════════════════════════════════════════════
-with tabs[3]:
+with tabs[5]:
     st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
     st.markdown('<div class="section-head"><div class="section-title">Chess News</div><div class="section-pill">Live · NewsAPI</div></div>', unsafe_allow_html=True)
 
@@ -834,9 +1156,9 @@ with tabs[3]:
     st.markdown('</div>', unsafe_allow_html=True)
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 5 — TOURNAMENTS
+# TAB 7 — TOURNAMENTS
 # ═══════════════════════════════════════════════════════════════════════════════
-with tabs[4]:
+with tabs[6]:
     st.markdown('<div class="section-wrap">', unsafe_allow_html=True)
     st.markdown('<div class="section-head"><div class="section-title">Live & Upcoming Tournaments</div><div class="section-pill">Lichess Broadcasts · Auto-refresh</div></div>', unsafe_allow_html=True)
 
@@ -888,6 +1210,6 @@ with tabs[4]:
 st.markdown(f"""<div style="text-align:center;padding:1.5rem;border-top:1px solid #141414">
     <div style="font-family:'Playfair Display',serif;font-size:.9rem;color:#2a2a2a">♟ hritikgupta · Chess Intelligence Dashboard</div>
     <div style="font-family:'JetBrains Mono',monospace;font-size:8px;color:#1a1a1a;margin-top:.3rem;letter-spacing:.1em">
-        LICHESS API · SUPABASE · GROQ LLAMA 70B · NEWSAPI · AUTO-REFRESH 2HRS
+        LICHESS API · SUPABASE · GROQ LLAMA 70B · NEWSAPI · AUTO-REFRESH 2HRS · ALL TIMES IST
     </div>
 </div>""", unsafe_allow_html=True)
