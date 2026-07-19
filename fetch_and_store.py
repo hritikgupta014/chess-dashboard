@@ -3,13 +3,14 @@ fetch_and_store.py
 Runs in GitHub Actions every 2 hours.
 Fetches all Lichess games for hritikgupta, analyses them,
 stores the result as a single JSON blob in Supabase.
+All time-based stats (hourly, weekday) are computed in IST.
 """
 import requests
 import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import defaultdict, Counter
 
 USERNAME      = "hritikgupta"
@@ -18,6 +19,8 @@ TITLES        = {"GM","IM","FM","CM","NM","WGM","WIM","WFM","WCM","LM"}
 SUPABASE_URL  = os.environ["SUPABASE_URL"]
 SUPABASE_KEY  = os.environ["SUPABASE_KEY"]
 LICHESS_TOKEN = os.environ.get("LICHESS_TOKEN", "")
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 def log(msg):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
@@ -141,7 +144,8 @@ def analyse(games):
 
         ts = g.get("createdAt",0)
         if ts:
-            dt      = datetime.fromtimestamp(ts/1000, tz=timezone.utc)
+            # IST — so "hourly" and "weekday" reflect Indian time
+            dt      = datetime.fromtimestamp(ts/1000, tz=IST)
             hour    = dt.hour
             weekday = dt.strftime("%a")
             stats["hourly"][hour]["g"]    += 1
